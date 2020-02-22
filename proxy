@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+
+"""
+Crude proxy on raw sockets. (NOTE: Rewrite the request_handler, resp.
+response_handler functions if you want to modify the packets coming
+from the client or target respectively.)
+"""
+
+from threading import Thread
+import ipaddress
+import argparse
+import logging
+import socket
+import sys
+
+stdin = sys.stdin
+stdout = sys.stdout
+
+LOCAL_HOST  = None
+LOCAL_PORT  = None
+TARGET_HOST = None
+TARGET_PORT = None
+RECV_FIRST  = False
+TIMEOUT     = None
+LOG_FILE    = None
+
+BACKLOG     = 5
+CHUNKSIZE   = 1024
+
+logger = None
+usage  = None
+
+
+def parse_arguments():
+    global usage
+    prog = sys.argv[0]
+    usage = 'Usage:\n$ %s --local IP PORT --target IP PORT [--recv-first] [--log-file LOG]' % prog
+
+    parser = argparse.ArgumentParser(
+        prog=prog,
+        usage=usage,
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description=__doc__,
+        epilog='')
+
+    options = parser.add_argument_group(title='options')
+
+    options.add_argument('--local',
+                        metavar='IP PORT',
+                        dest='local',
+                        required=True,
+                        nargs='+',
+                        help='local address and listening port')
+    options.add_argument('--target',
+                        metavar='IP PORT',
+                        dest='target',
+                        required=True,
+                        nargs='+',
+                        help='target address and port'),
+    options.add_argument('--timeout',
+                        metavar='SECS',
+                        dest='timeout',
+                        type=float,
+                        default=2.0,
+                        required=False,
+                        help='timeout (secs) in communication with target')
+    options.add_argument('--recv-first', '--rf',
+                        dest='recv_first',
+                        action='store_true',
+                        help='receive before sending to target host')
+    options.add_argument('--log-file',
+                         dest='log_file',
+                         metavar='LOG',
+                         required=False,
+                         help='relative path to log file')
+
+    return parser.parse_args()
+
+
+def extract_options(parsed):
+    global LOCAL_HOST
+    global LOCAL_PORT
+    global TARGET_HOST
+    global TARGET_PORT
+    global RECV_FIRST
+    global TIMEOUT
+    global LOG_FILE
+    for opts, setup in ((parsed.local, 'local'), (parsed.target, 'target')):
+        try:
+            host, port = opts
+            ipaddress.ip_address(host)
+            port = int(port)
+        except ValueError:
+            logger.info("[-] Invalid arguments for %s setup. Try something like"
+                  "\n\n--%s 127.0.0.1 8080\n" % (setup, setup))
+            logger.info(usage)
+            sys.exit(1)
+        if setup == 'local':
+            LOCAL_HOST, LOCAL_PORT = host, port
+        else:
+            TARGET_HOST, TARGET_PORT = host, port
+    RECV_FIRST = parsed.recv_first
+    TIMEOUT = parsed.timeout
+    LOG_FILE = parsed.log_file
+
+
+def configure_logger():
+    global logger
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    streamHandler = logging.StreamHandler()
+    streamHandler.setLevel(logging.INFO)
+    logger.addHandler(streamHandler)
+    if LOG_FILE:
+        fileHandler = logging.FileHandler(LOG_FILE)
+        fileHandler.setLevel(logging.INFO)
+        logger.addHandler(fileHandler)
+
+
+def hexdump(buffer, length=16):
+    dumped = '\n'
+    offset = 0
+    while buffer:
+       byteseq, buffer = buffer[:length], buffer[length:]
+       hexa = ''
+       text = ''
+       for byte in byteseq:
+           hexa += ' %02x' % byte
+           text += chr(byte) if 0x20 <= byte < 0x7F else '.'
+       dumped += '%04x   %-*s   %s\n' % (offset, length * 3, hexa.lstrip(), text)
+       offset += length
+    return dumped
+
+
+def recv_data(conn):
+    recv = conn.recv
+    buffer = b''
+    try:
+        while 1:
+            chunk = recv(CHUNKSIZE)
+            if not chunk:
+                break
+            buffer += chunk
+    except:                     # Anything could go bad here
+        pass
+    return buffer
+
+
+def request_handler(buffer):
+    #
+    # Modify here packet from client to target
+    #
+    return buffer
+
+
+def response_handler(buffer):
+    #
+    # Modify here packet from host to client
+    #
+    return buffer
+
+
+def proxy_handler(socket__, ip, port):
+    try:
+        __socket = socket.create_connection((TARGET_HOST, TARGET_PORT))
+    except ConnectionRefusedError as err:
+        logger.info("[-] Could not establish connection to target host")
+        sys.exit(1)
+    _, __port = __socket.getsockname()
+    logger.info(f"[+] Proxy for %s:%d established at port %d" % (ip, port, __port))
+    __socket.settimeout(TIMEOUT)
+    if RECV_FIRST:
+        remote_buffer = redirect(__socket, socket__, response_handler, ip, port)
+    while 1:
+        local_buffer  = redirect(socket__, __socket, request_handler,  ip, port)
+        remote_buffer = redirect(__socket, socket__, response_handler, ip, port)
+        if not local_buffer and not remote_buffer:
+            logger.info("[+] No more data. Closing connections.")
+            socket__.close()
+            __socket.close()
+            break
+
+
+def redirect(from_sender, to_receiver, buffer_handler, ip, port):
+    buffer = recv_data(from_sender)
+    if buffer:
+        buffer_size = len(buffer)
+        if buffer_handler == request_handler:
+            recv_message = "[+] Received %d bytes from %s:%d" % (
+                buffer_size, ip, port)
+            redirect_msg = "[ ===> ] Redirecting to target\n"
+        else:
+            recv_message = "[+] Received %d bytes from target host" % buffer_size
+            redirect_msg = "[ <=== ] Redirecting to client %s:%d\n" % (ip, port)
+        logger.info(recv_message)
+        logger.info(hexdump(buffer))
+        buffer = buffer_handler(buffer)
+        logger.info(redirect_msg)
+        to_receiver.send(buffer)
+    return buffer
+
+
+def run_server():
+    stdout.write('\n')
+    try:
+        __socket__ = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    except OSError as err:
+        logger.info(f"[-] Could not open listening socket: {err}")
+        sys.exit(1)
+    __socket__.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        __socket__.bind((LOCAL_HOST, LOCAL_PORT))
+        __socket__.listen(BACKLOG)
+    except OSError as err:
+        __socket__.close()
+        logger.info(f"[-] Cound not bind socket: {err}")
+        sys.exit(1)
+    logger.info("[+] Listening on %s:%d, redirerecting to %s:%d" % (
+        LOCAL_HOST, LOCAL_PORT, TARGET_HOST, TARGET_PORT))
+    with __socket__:
+        while 1:
+            try:
+                socket__, (ip, port) = __socket__.accept()
+                logger.info('[+] Connection from %s:%d received' % (ip, port))
+                proxy_thread = Thread(target=proxy_handler,
+                    args=(socket__, ip, port,), daemon=True)
+                proxy_thread.start()
+            except KeyboardInterrupt:
+                stdout.write('\n')
+                break
+    logger.info("Server shutting down...")
+    sys.exit(0)
+
+
+if __name__ == '__main__':
+    extract_options(parse_arguments())
+    configure_logger()
+    run_server()
