@@ -215,7 +215,7 @@ def run_server():
         __socket__.close()
         logger.info(f"[-] Cound not bind socket: {err}")
         sys.exit(1)
-    logger.info("[+] Listening on %s:%d, redirerecting to %s:%d" % (
+    logger.info("[+] Listening on %s:%d, redirecting to %s:%d" % (
         LOCAL_HOST, LOCAL_PORT, TARGET_HOST, TARGET_PORT))
     with __socket__:
         while 1:
